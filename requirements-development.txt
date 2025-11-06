@@ -1,0 +1,10 @@
+fastapi==0.120.4
+kafka-python==2.2.15
+pydantic==2.12.3
+pytest==8.4.2
+redis==7.0.1
+requests==2.32.5
+uvicorn==0.38.0
+auth0-api-python==1.0.0b6
+psycopg[binary,pool]==3.2.3
+auth0-python==4.13.0

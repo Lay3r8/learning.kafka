@@ -1,0 +1,274 @@
+services:
+  # Kafka Broker (KRaft Mode - No Zookeeper Required)
+  kafka:
+    image: apache/kafka:4.0.1
+    container_name: kafka
+    ports:
+      - "${KAFKA_EXTERNAL_PORT}:9092"
+      - "${KAFKA_INTERNAL_PORT}:9093"
+    environment:
+      # KRaft mode configuration
+      KAFKA_NODE_ID: ${KAFKA_NODE_ID}
+      KAFKA_PROCESS_ROLES: ${KAFKA_PROCESS_ROLES}
+      KAFKA_CONTROLLER_QUORUM_VOTERS: ${KAFKA_CONTROLLER_QUORUM_VOTERS}
+      KAFKA_CONTROLLER_LISTENER_NAMES: ${KAFKA_CONTROLLER_LISTENER_NAMES}
+
+      # Listener configuration
+      KAFKA_LISTENERS: ${KAFKA_LISTENERS}
+      KAFKA_ADVERTISED_LISTENERS: ${KAFKA_ADVERTISED_LISTENERS}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: ${KAFKA_LISTENER_SECURITY_PROTOCOL_MAP}
+      KAFKA_INTER_BROKER_LISTENER_NAME: ${KAFKA_INTER_BROKER_LISTENER_NAME}
+
+      # Cluster configuration
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: ${KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR}
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: ${KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR}
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: ${KAFKA_TRANSACTION_STATE_LOG_MIN_ISR}
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: ${KAFKA_AUTO_CREATE_TOPICS_ENABLE}
+
+      # KRaft cluster ID (must be a valid UUID)
+      CLUSTER_ID: ${CLUSTER_ID}
+    networks:
+      - gaming-network
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-cluster.sh cluster-id --bootstrap-server kafka:9092 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  # Redis - Read Model Storage
+  redis:
+    image: redis:8.2.2-alpine3.22
+    container_name: redis
+    ports:
+      - "${REDIS_PORT_EXTERNAL}:6379"
+    networks:
+      - gaming-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - redis-data:/data
+
+  # PostgreSQL - User Service Database
+  postgres:
+    image: postgres:17.2-alpine3.21
+    container_name: postgres
+    ports:
+      - "${POSTGRES_PORT_EXTERNAL}:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    networks:
+      - gaming-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./services/user-service/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  # Command Service (CQRS Write Side)
+  command-service:
+    build:
+      context: ./services
+      dockerfile: command-service/Dockerfile
+    container_name: command-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+    networks:
+      - gaming-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # User Service (User Management & Auth0 Integration)
+  user-service:
+    build:
+      context: ./services
+      dockerfile: user-service/Dockerfile
+    container_name: user-service
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      KAFKA_USER_TOPIC: ${KAFKA_USER_TOPIC}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      # Auth0 Management API credentials
+      AUTH0_DOMAIN: ${AUTH0_DOMAIN}
+      AUTH0_MGMT_CLIENT_ID: ${AUTH0_MGMT_CLIENT_ID}
+      AUTH0_MGMT_CLIENT_SECRET: ${AUTH0_MGMT_CLIENT_SECRET}
+      AUTH0_CONNECTION: ${AUTH0_CONNECTION}
+    networks:
+      - gaming-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Event Processor (Event Sourcing Engine)
+  event-processor:
+    build:
+      context: ./services
+      dockerfile: event-processor/Dockerfile
+    container_name: event-processor
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+      KAFKA_GROUP_ID: ${KAFKA_GROUP_ID}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      SNAPSHOT_INTERVAL: ${SNAPSHOT_INTERVAL}
+    networks:
+      - gaming-network
+    restart: unless-stopped
+
+  # User Event Processor (Handles user-events topic)
+  user-event-processor:
+    build:
+      context: ./services
+      dockerfile: user-event-processor/Dockerfile
+    container_name: user-event-processor
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      KAFKA_USER_TOPIC: ${KAFKA_USER_TOPIC}
+      KAFKA_USER_GROUP_ID: ${KAFKA_USER_GROUP_ID}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    networks:
+      - gaming-network
+    restart: unless-stopped
+
+  # Query Service (CQRS Read Side)
+  query-service:
+    build:
+      context: ./services
+      dockerfile: query-service/Dockerfile
+    container_name: query-service
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+    networks:
+      - gaming-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # API Gateway (Experience API Layer / BFF)
+  api-gateway:
+    build:
+      context: ./services
+      dockerfile: api-gateway/Dockerfile
+    container_name: api-gateway
+    depends_on:
+      - command-service
+      - query-service
+      - user-service
+    ports:
+      - "${API_GATEWAY_PORT}:8000"
+    environment:
+      COMMAND_SERVICE_URL: http://command-service:5000
+      QUERY_SERVICE_URL: http://query-service:5001
+      USER_SERVICE_URL: http://user-service:5002
+      # Auth0 JWT Verification
+      AUTH0_DOMAIN: ${AUTH0_DOMAIN}
+      AUTH0_AUDIENCE: ${AUTH0_AUDIENCE}
+    networks:
+      - gaming-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Frontend (React + React Router)
+  frontend:
+    build:
+      context: ./services/frontend
+      dockerfile: Dockerfile
+      args:
+        # Pass build-time arguments for Vite
+        VITE_API_GATEWAY_URL: http://localhost:${API_GATEWAY_PORT}
+        VITE_API_GATEWAY_URL_SERVER: http://api-gateway:8000
+        VITE_AUTH0_DOMAIN: ${AUTH0_DOMAIN}
+        VITE_AUTH0_CLIENT_ID: ${AUTH0_CLIENT_ID}
+        VITE_AUTH0_AUDIENCE: ${AUTH0_AUDIENCE}
+    container_name: frontend
+    depends_on:
+      - api-gateway
+    ports:
+      - "${FRONTEND_PORT}:3000"
+    environment:
+      # Runtime environment variables (for server-side)
+      VITE_API_GATEWAY_URL: http://localhost:${API_GATEWAY_PORT}
+      VITE_API_GATEWAY_URL_SERVER: http://api-gateway:8000
+      VITE_AUTH0_DOMAIN: ${AUTH0_DOMAIN}
+      VITE_AUTH0_CLIENT_ID: ${AUTH0_CLIENT_ID}
+      VITE_AUTH0_AUDIENCE: ${AUTH0_AUDIENCE}
+    networks:
+      - gaming-network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+networks:
+  gaming-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+    driver: local
+  kafka-data:
+    driver: local
+  postgres-data:
+    driver: local
